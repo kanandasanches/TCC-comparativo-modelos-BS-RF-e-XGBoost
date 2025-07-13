@@ -1,0 +1,430 @@
+---
+title: "Análise de Agrupamentos - Buhlmann-Straub"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# 1. Introdução
+
+Este estudo visa empregar a teoria da credibilidade, focando no modelo de Bühlmann-Straub, na avaliação de preços de risco em seguros de carro. Usaremos a base de dados do Hyundai HB20, que contém dados do Sistema AUTOSEG da SUSEP – um local que junta estatísticas de apólices e acidentes de várias seguradoras.
+
+A ideia é calcular os preços de frequência-severidade para clientes divididos em grupos de risco, levando em conta a frequência e a gravidade dos acidentes. Para isso, usaremos métodos bayesianos, com o auxílio do pacote RStan, para incluir a diferença entre e dentro dos grupos. O estudo também vai comparar os resultados da credibilidade com estimativas diretas, vendo as vantagens do método e com a modelagem do prêmio por Modelos de Machine Learning.
+
+Também será aplicada uma análise inicial dos dados, para entender como as variáveis se comportam e justificar a escolha dos grupos de risco.
+
+```{r setup, include=FALSE}
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(stringi)
+library(tidyr)
+library(gridExtra)
+library(ggplot2)
+library(rsample)
+library(rstan)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(cluster)
+library(stats)
+library(thematic)
+library(tidyverse)
+library(plotly)
+library(kableExtra)
+library(gridExtra)
+library(xtable)
+library(reshape2)
+library(rstan)  ### para utilizacao de inferencia bayesiana
+library(bayesplot)
+```
+
+# 2. Descrição dos dados
+
+Nesta análise, utilizamos a base de dados do Sistema AUTOSEG da SUSEP sobre apólices e sinistros do Hyunday HB20 em todo o Brasil, de 2017 a 2020. 
+
+## Carregar dados
+
+```{r}
+df <- read.csv("C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020.csv", encoding = "UTF-8")
+# df <- read.csv("C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/dados-atividade02-brasil.csv", sep=";", encoding = "UTF-8")
+# df <- df %>%
+#   mutate(
+#     Grupo_Ato = paste(Faixa_Etaria, substr(Regiao, 1, 6), sep = " | ")
+#   ) %>%
+#   filter(Expostos > 100)
+df <- df %>%
+  mutate(
+    Regiao = case_when(
+      Regiao == "PR - FIguacu-Medianeira-Cascavel-Toledo" ~ "PR - F.Iguathu-Medianeira-Cascavel-Toledo",
+      Regiao == "PR - Met. Curitiba" ~ "PR - Met Curitiba",
+      Regiao == "RJ - Met. do Rio de Janeiro" ~ "RJ - Met do Rio de Janeiro",
+      Regiao == "RS - Met. Porto Alegre e Caxias do Sul" ~ "RS - Met Porto Alegre e Caxias do Sul",
+      Regiao == "SC - Met. Florianopolis e Sul" ~ "SC - Met Florianopolis e Sul",
+      Regiao == "SP - Met. de Sao Paulo" ~ "SP - Met de Sao Paulo",
+      Regiao == "SP - Ribeirao Preto e Demais Mun. de Campinas" ~ "SP - Ribeirao Preto e Demais Mun de Campinas",
+      Regiao == "MG - MetBH-Centro Oeste-Zona Mata-C Vertentes" ~ "MG - Met.BH-Centro Oeste-Zona Mata-C. Vertentes",
+      TRUE ~ Regiao
+    ),
+    Frequencia = Freq_Colisao / Expostos,
+    Severidade = if_else(Freq_Colisao > 0, Ind_Colisao.RS. / Freq_Colisao, 0),
+    Razao_Sinistralidade = Ind_Colisao.RS. / Expostos,
+  )
+write.csv(df, "C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020_Ajustada.csv", row.names = FALSE)
+dados <- df %>%
+  group_by(Regiao, Ano) %>%
+  summarise(
+    Expostos = sum(Expostos),
+    Freq_Total = sum(Freq_Colisao),
+    Ind_Total = sum(Ind_Colisao.RS.),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Frequencia = Freq_Total / Expostos,
+    Severidade = if_else(Freq_Total > 0, Ind_Total / Freq_Total, 0),
+    Razao = Ind_Total / Expostos
+  )
+write.csv(dados, "C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020_Agrupado_Regiao_Ano.csv", row.names = FALSE)
+```
+
+Cada linha da base representa um conjunto de informações, agrupadas por diferentes combinações de variáveis, como o ano em que a apólice foi emitida, a região, o sexo do segurado e a sua faixa etária. Serão utilizadas as variáveis a seguir:
+
+* Ano: o ano de emissão da apólice;
+* Regiao: a região onde o seguro foi contratado;
+* Sexo: o sexo do segurado (Masculino ou Feminino);
+* Faixa_Etaria: a faixa etária do segurado (por exemplo: "Entre 18 e 25 anos");
+* Expostos: o número de veículos segurados (expostos ao risco);
+* Freq_Colisao: a frequência de sinistros por roubo/furto;
+* Ind_Colisao.RS.: a indenização média paga por roubo/furto (em reais);
+
+
+# 3. Análise Exploratória dos Dados
+
+Para descobrir tendências e variações entre diferentes grupos de segurados, a base de dados original foi organizada em categorias com base em três pontos principais: região, gênero do segurado e faixa etária. Para cada um desses grupos, foram calculados:
+
+* Expostos: Total de pessoas seguradas.
+* Freq: Quantidade de ocorrências de sinistros por roubo/furto.
+* Ind_Total: Valor total pago em sinistros por roubo/furto.
+* Frequencia: Frequência relativa de sinistros (Freq / Expostos).
+* Severidade: Severidade média dos sinistros (Sinist / Freq).
+* Razao: Sinistralidade total (Sinist / Expostos).
+
+## Agregação por Faixa Etária + Região
+
+```{r}
+dados_agrupados <- df %>%
+  group_by(Regiao) %>%
+  summarise(
+    Expostos = sum(Expostos),
+    Freq_Total = sum(Freq_Colisao),
+    Ind_Total = sum(Ind_Colisao.RS.),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Frequencia = Freq_Total / Expostos,
+    Severidade = if_else(Freq_Total > 0, Ind_Total / Freq_Total, 0),
+    Razao = Ind_Total / Expostos
+  )
+dados_agrupados <- dados_agrupados %>%
+  mutate(
+    Grupo_Tarifario = case_when(
+      Razao < 450 ~ "Baixo",
+      Razao < 550 ~ "Medio",
+      TRUE ~ "Alto"
+    )
+  )
+write.csv(dados_agrupados, "C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020_Agrupada_Regiao.csv", row.names = FALSE)
+```
+```{r}
+
+df_AnII = df %>%
+  group_by(Regiao, Ano) %>%
+  summarise(Expostos = sum(Expostos),
+            Freq = sum(Freq_Colisao),
+            Sinist = sum(Ind_Colisao.RS.)) %>%
+  mutate(Razao_Freq = Freq/Expostos,
+         Razao_Sinis = case_when(
+           Freq > 0 ~ Sinist/Freq,
+           TRUE ~ 0),
+         Razao = Sinist/Expostos) %>%
+  arrange(desc(Razao))
+
+
+df_AnIII = df %>%
+  group_by(Sexo, Ano) %>%
+  summarise(Expostos = sum(Expostos),
+            Freq = sum(Freq_Colisao),
+            Sinist = sum(Ind_Colisao.RS.)) %>%
+  mutate(Razao_Freq = Freq/Expostos,
+         Razao_Sinis = case_when(
+           Freq > 0 ~ Sinist/Freq,
+           TRUE ~ 0),
+         Razao = Sinist/Expostos) %>%
+  arrange(desc(Razao))
+
+
+df_AnIV = df %>%
+  group_by(Faixa_Etaria, Ano) %>%
+  summarise(Expostos = sum(Expostos),
+            Freq = sum(Freq_Colisao),
+            Sinist = sum(Ind_Colisao.RS.)) %>%
+  mutate(Razao_Freq = Freq/Expostos,
+         Razao_Sinis = case_when(
+           Freq > 0 ~ Sinist/Freq,
+           TRUE ~ 0),
+         Razao = Sinist/Expostos) %>%
+  arrange(desc(Razao))
+
+df_AnV = df %>%
+  group_by(Faixa_Etaria, Sexo, Ano) %>%
+  summarise(Expostos = sum(Expostos),
+            Freq = sum(Freq_Colisao),
+            Sinist = sum(Ind_Colisao.RS.)) %>%
+  mutate(Razao_Freq = Freq/Expostos,
+         Razao_Sinis = case_when(
+           Freq > 0 ~ Sinist/Freq,
+           TRUE ~ 0),
+         Razao = Sinist/Expostos) %>%
+  arrange(desc(Razao))
+```
+## 3.1 Gráficos Exploratórios
+
+**Por gênero**
+
+
+```{r, fig.width=12, fig.height=4, echo=FALSE}
+
+### grafico da frequencia e severidade por sexo 
+g1 = ggplot(data = df_AnIII, mapping = aes(x=Sexo,y=Razao_Freq)) +
+  geom_boxplot(alpha = 0.6, col = "blue") +
+  xlab("")+
+  ylab("Frequencia/Expostos")+
+  labs(subtitle = "Frequencia (por sexo do condutor)")
+
+
+g2 = ggplot(data = df_AnIII, mapping = aes(x=Sexo,y=Razao_Sinis)) +
+  geom_boxplot(alpha = 0.6, col = "red") +
+  xlab("")+
+  ylab("Indenizacoes/Frequencia")+
+  labs(subtitle = "Indenizacoes (por sexo do condutor)")
+
+
+g3 = ggplot(data = df_AnIII, mapping = aes(x=Sexo,y=Razao)) +
+  geom_boxplot(alpha = 0.6, col = "green") +
+  xlab("")+
+  ylab("Sinistros/Expostos")+
+  labs(subtitle = "Por sexo do condutor")
+
+grid.arrange(g1,g2,g3,ncol=3) 
+
+```
+
+
+**Por Faixa Etária**
+
+
+```{r, fig.width=12, fig.height=4, echo=FALSE}
+
+### grafico da frequencia e severidade por faixa etaria 
+g1 = ggplot(data = df_AnIV, mapping = aes(x=Faixa_Etaria,y=Razao_Freq)) +
+  geom_boxplot(alpha = 0.6, col = "blue") +
+  xlab("")+
+  ylab("Frequencia/Expostos")+
+  labs(subtitle = "Freq.(por faixa etaria)") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+g2 = ggplot(data = df_AnIV, mapping = aes(x=Faixa_Etaria,y=Razao_Sinis)) +
+  geom_boxplot(alpha = 0.6, col = "red") +
+  xlab("")+
+  ylab("Indenizacoes/Frequencia")+
+  labs(subtitle = "Indeniz. (por faixa etaria)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+g3 = ggplot(data = df_AnIV, mapping = aes(x=Faixa_Etaria,y=Razao)) +
+  geom_boxplot(alpha = 0.6, col = "red") +
+  xlab("")+
+  ylab("Sinistros/Expostos")+
+  labs(subtitle = "(por faixa etaria)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+grid.arrange(g1,g2,g3,ncol=3)
+```
+
+
+**Por Região**
+
+```{r, fig.width=12, fig.height=4, echo=FALSE}
+
+### encurtando o nome das regioes so pra n dar problema no plot
+df_AnII$Regiao_peq <- substr(df_AnII$Regiao, 1, 6)
+
+
+### grafico da frequencia e severidade por regiao e tambem da Razao
+g1 = ggplot(data = df_AnII, mapping = aes(x=reorder(Regiao_peq,Razao_Freq),
+                                         y=Razao_Freq)) +
+  geom_boxplot(alpha = 0.6, col = "blue") +
+  xlab("")+
+  ylab("Frequencia/Expostos")+
+  labs(subtitle = "Frequencia (por regiao)")+
+  coord_flip()
+
+
+g2 = ggplot(data = df_AnII, mapping = aes(x=reorder(Regiao_peq,Razao_Sinis),
+                                         y=Razao_Sinis)) +
+  geom_boxplot(alpha = 0.6, col = "red") +
+  xlab("")+
+  ylab("Indenizacoes/Frequencia")+
+  labs(subtitle = "Indenizacoes (por regiao)")+
+  coord_flip()
+
+g3 = ggplot(data = df_AnII, mapping = aes(x=reorder(Regiao_peq,Razao),
+                                          y=Razao_Sinis)) +
+  geom_boxplot(alpha = 0.6, col = "red") +
+  xlab("")+
+  ylab("Indenizacoes/Expostos")+
+  labs(subtitle = "(por regiao)")+
+  coord_flip()
+
+
+grid.arrange(g1,g2,g3, ncol=3)
+```
+* *Por gênero:* Em linhas gerais, é possível concluir que as mulheres se envolvem em menos colisões e, além disso, os valores médios de indenização são um pouco menores quando comparados aos dos homens. Os acidentes tendem a ser menos comuns e, também, menos custosos quando a condutora é do sexo feminino. Ainda assim, a diferença entre os grupos não é tão significativa a ponto de definir diferentes níveis de risco unicamente com base no sexo do condutor.
+
+* *Por faixa etária:* Pode-se notar que motoristas mais novos (até 25 anos) se envolvem mais em acidentes por colisão. A partir dos 26, essa taxa cai aos poucos, chegando ao ponto mais baixo entre os 36 e 45 anos. Depois dessa idade, diminui, mostrando que motoristas de idades mais avançadas têm menos chances de colidir. A média de indenização não muda muito entre as diferentes idades. Embora motoristas mais novos mostrem uma tendência a indenizações maiores, a média fica quase a mesma, o que sugere que a faixa etária isolada pode não ser uma variável tão significativa.
+
+* *Por região:* Em certas regiões, a frequência de sinistros por colisão chama atenção com números bem maiores. As áreas do Rio de Janeiro (RJ), São Paulo (SP), Tocatins (TO) e Amapá (AM) se destacam com alta sinistralidade. Em contrapartida, existem regiões com quase nenhum ou poucos incidentes, como Roraima (RR) e Acre (AC). Essas diferenças indicam que o risco de colisão é maior em algumas regiões. Observando o gráfico de indenizações, as regiões de SP e RJ se sobressaem com valores mais altos de severidade e sinistralidade. No gráfico de indenizações/frequência, a distribuição entre as regiões é mais equilibrada, indicando que a relação entre pagamentos e frequência de ocorrência é mais uniforme. Entretanto, podemos observar algumas exceções, como é o caso de Roraima, que exibe grande variação nos valores pagos. 
+
+Após a avaliação dos gráficos, entendemos que a "região" pode ser uma variável de classificação das classes de risco. Em resumo, a "região" é um dado valioso para nossa análise. Ela nos ajuda a separar claramente grupos de maior e menor risco, tanto na frequência quanto no valor das indenizações. Além disso, nos dá uma visão importante sobre o tipo de risco em cada lugar. Assim, a divisão por região representa uma variável explicativa relevante. 
+
+
+## 3.2 Classes de riscos
+
+Como a base AUTOSEG divide o Brasil em 41 regiões, e como foi observado que algumas regiões possuem comportamentos similares entre si nas variáveis de estudo, foi estabelecido um critério para agrupar e classificar cada região como sendo de:
+
+* Alto risco: Indenizações/Expostos ≥ 550;
+* Médio risco: 450 ≤ Indenizações/Expostos < 550;
+* Baixo risco: Indenizações/Expostos < 450.
+
+```{r}
+# Certificando que 'Ano' está no formato inteiro
+dados_agrupados <- dados %>%
+  mutate(Ano = as.integer(Ano))
+
+# análise temporal das indenizações por colisão
+
+# Agora agrupar e somar
+sinistros_por_ano <- dados %>%
+  group_by(Ano) %>%
+  summarise(Sinistros = sum(Severidade, na.rm = TRUE)) %>%
+  filter(Ano %in% 2017:2020)
+
+# Validar resultado
+print(sinistros_por_ano)
+
+# Plotar se houver dados
+if (nrow(sinistros_por_ano) > 0) {
+  ggplot(sinistros_por_ano, aes(x = Ano, y = Sinistros)) +
+    geom_line(size = 1.2, color = "steelblue") +
+    geom_point(size = 3, color = "darkred") +
+    labs(
+      title = "Análise Temporal dos Sinistros (2017 a 2020)",
+      x = "Ano",
+      y = "Total de Sinistros"
+    ) +
+    theme_minimal()
+} else {
+  cat("⚠️ Nenhum dado disponível para os anos 2017 a 2020.\n")
+}
+
+# análise temporal das frequência por colisão
+
+# Agora agrupar e somar
+freq_por_ano <- dados %>%
+  group_by(Ano) %>%
+  summarise(Frequencia = sum(Freq_Total/Expostos, na.rm = TRUE)) %>%
+  filter(Ano %in% 2017:2020)
+
+# Validar resultado
+print(freq_por_ano)
+
+# Plotar se houver dados
+if (nrow(freq_por_ano) > 0) {
+  ggplot(freq_por_ano, aes(x = Ano, y = Frequencia)) +
+    geom_line(size = 1.2, color = "steelblue") +
+    geom_point(size = 3, color = "darkred") +
+    labs(
+      title = "Análise Temporal da Frequencia (2017 a 2020)",
+      x = "Ano",
+      y = "Frequência"
+    ) +
+    theme_minimal()
+} else {
+  cat("⚠️ Nenhum dado disponível para os anos 2017 a 2020.\n")
+}
+
+
+#Severidade/Expostos
+
+# análise temporal das indenizações por colisão
+
+# Agora agrupar e somar
+severidade_por_ano <- dados %>%
+  group_by(Ano) %>%
+  summarise(Razao_Sev = sum(Severidade/Expostos, na.rm = TRUE)) %>%
+  filter(Ano %in% 2017:2020)
+
+# Validar resultado
+print(severidade_por_ano)
+
+# Plotar se houver dados
+if (nrow(severidade_por_ano) > 0) {
+  ggplot(severidade_por_ano, aes(x = Ano, y = Razao_Sev)) +
+    geom_line(size = 1.2, color = "steelblue") +
+    geom_point(size = 3, color = "darkred") +
+    labs(
+      title = "Análise Temporal da Razão Sinistralidade (2017 a 2020)",
+      x = "Ano",
+      y = "Razão_Sinis"
+    ) +
+    theme_minimal()
+} else {
+  cat("⚠️ Nenhum dado disponível para os anos 2017 a 2020.\n")
+}
+
+
+# análise temporal da Exposição por colisão
+
+# Agora agrupar e somar
+expostos_por_ano <- dados %>%
+  group_by(Ano) %>%
+  summarise(Expostos = sum(Expostos, na.rm = TRUE)) %>%
+  filter(Ano %in% 2017:2020)
+
+# Validar resultado
+print(expostos_por_ano)
+
+# Plotar se houver dados
+if (nrow(expostos_por_ano) > 0) {
+  ggplot(expostos_por_ano, aes(x = Ano, y = Expostos)) +
+    geom_line(size = 1.2, color = "steelblue") +
+    geom_point(size = 3, color = "darkred") +
+    labs(
+      title = "Análise Temporal da Exposição (2017 a 2020)",
+      x = "Ano",
+      y = "Expostos"
+    ) +
+    theme_minimal()
+} else {
+  cat("⚠️ Nenhum dado disponível para os anos 2017 a 2020.\n")
+}
+
+
+
+```

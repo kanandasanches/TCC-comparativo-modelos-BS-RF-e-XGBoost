@@ -1,0 +1,990 @@
+---
+title: "Modelagem do Prêmio frequência-severidade por Bullman-Straub, Random Forest e XGboost com grupos tarifários agrupados por experiência do analista"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(stringi)
+library(tidyr)
+library(gridExtra)
+library(ggplot2)
+library(rsample)
+library(rstan)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(cluster)
+library(stats)
+library(thematic)
+library(tidyverse)
+library(plotly)
+library(kableExtra)
+library(gridExtra)
+library(xtable)
+library(reshape2)
+library(rstan)  ### para utilizacao de inferencia bayesiana
+library(bayesplot)
+```
+
+# Introdução
+
+Este trabalho utiliza dados extraídos do sistema AUTOSEG, disponibilizado pela Superintendência de Seguros Privados (SUSEP), referentes ao modelo de veículo Hyundai HB20, nos anos de 2017, 2018, 2019 e 2020.
+Ressalta-se que os dados referentes ao ano de 2016 não estavam disponíveis no sistema no momento da extração das informações, por isso não foi considerado.
+
+O sistema AUTOSEG permite a realização de consultas on-line sobre dados estatísticos do seguro de automóveis. As informações disponibilizadas têm como base os arquivos enviados semestralmente pelas seguradoras, conforme previsto no item 9 do Manual de Orientação anexo à Circular SUSEP nº 522/2015, abrangendo dados de apólices vigentes e sinistros ocorridos durante o período analisado.
+
+
+## Carregar dados
+
+```{r}
+df_regiao <- read.csv("C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020_Agrupada_Regiao.csv", encoding = "UTF-8")
+df_regiao_ano <- read.csv("C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020_Agrupado_Regiao_Ano.csv", encoding = "UTF-8")
+```
+
+A base de dados analisada é composta por 1640 observações e 16 variáveis, conforme descritas a seguir:
+  
+  * Ano: Ano de ocorrência do dado;
+
+* Categoria: Categoria do veículo segurado;
+
+* Região: Unidade da federação ou região onde o seguro foi contratado;
+
+* Grupo: Identificação do modelo do veículo;
+
+* Ano_Modelo: Ano de fabricação/modelo do veículo;
+
+* Sexo: Sexo do condutor principal;
+
+* Faixa_Etária: Faixa etária do condutor principal;
+
+* IS_Media.RS.: Importância segurada média, em reais;
+
+* Expostos: Quantidade de exposições ao risco (veículos-seguro);
+
+* Premio_Medio.RS.: Prêmio médio pago pelo seguro, em reais;
+
+* Freq_Inc_Roubo: Frequência de sinistros por roubo ou furto;
+
+* Ind_Inc_Roubo.RS.: Indenização paga por sinistros de roubo ou furto, em reais;
+
+* Freq_Colisao: Frequência de sinistros por colisão;
+
+* Ind_Colisao.RS.: Indenização paga por sinistros de colisão, em reais;
+
+* Freq_Outros: Frequência de sinistros classificados como outros;
+
+* Ind_Outras.RS.: Indenização paga por sinistros classificados como outros, em reais.
+
+
+## 2. Medidas de avaliação de risco
+
+
+A partir da análise dos dados de sinistro, após identificar possiveis grupos de risco para segregar os dados em classes, foram observadas as razoes de Sinistros/Expostos mensais e Razões Frequência para o grupamento por região.
+  
+# ==========================================
+# AGRUPANDO POR GRUPOS TARIFARIOS - Analista
+# ==========================================
+```{r}
+grupoAlt = unique((df_regiao %>% filter(Grupo_Tarifario == "Alto"))$Regiao) # alto indice de colisão
+grupoMed = unique((df_regiao %>% filter(Grupo_Tarifario == "Medio"))$Regiao) # medio indice de colisão
+grupoBai = unique((df_regiao %>% filter(Grupo_Tarifario == "Baixo"))$Regiao) # baixo indice de colisão
+
+df = df_regiao_ano %>%
+  mutate(Grupo_Tarifario = case_when(
+    Regiao %in% grupoAlt ~ "Alto",
+    Regiao %in% grupoMed ~ "Medio",
+    Regiao %in% grupoBai ~ "Baixo")) %>%
+  group_by(Grupo_Tarifario, Ano) %>%
+  summarise(Expostos = sum(Expostos),
+            Freq_Total = sum(Freq_Total),
+            Ind_Total = sum(Ind_Total)) %>%
+  mutate(Frequencia = Freq_Total / Expostos,
+         Severidade = case_when(
+           Freq_Total > 0 ~ Ind_Total/Freq_Total,
+           TRUE ~ 0),
+         Razao = Ind_Total / Expostos)
+View(df)
+```
+
+### 3.2.1 Análise Exploratória por Classe de Riscos
+
+```{r, echo=FALSE}
+## Analise exploratoria dos dados após a escolha dos grupos
+df_1 = df %>%
+  arrange(match(Grupo_Tarifario, c("Alto", "Medio", "Baixo")))  %>%
+  mutate(Severidade = round(Severidade, 2)) %>%
+  mutate(Razao = round(Razao, 1)) %>%
+  ungroup()
+
+df_1g = df_1
+df_1 = df_1 %>% select(-Grupo_Tarifario)
+
+g1 = ggplot(data = filter(df_1g, Ano != "2020"),
+            mapping = aes(x = reorder(Grupo_Tarifario, Frequencia),
+                          y = Frequencia)) +
+  geom_boxplot(alpha = 0.6, col = "blue") +
+  xlab("")+
+  ylab("Frequencia / Expostos")+
+  labs(subtitle = "Frequencia (por grupo tarifario)")
+
+g2 = ggplot(data = filter(df_1g, Ano != "2020"),
+            mapping = aes( x = reorder(Grupo_Tarifario, Severidade),
+                          y = Severidade)) +
+  geom_boxplot(alpha = 0.6, col = "red") +
+  xlab("")+
+  ylab("Indenizacoes / Frequencia")+
+  labs(subtitle = "Indenizacoes (por grupo tarifario)")
+
+grid.arrange(g1, g2, ncol=2)
+
+dados_sev = df
+```
+
+### Versão Bayesiana do modelo de Bühlmann-Straub
+#======================
+#===== SEVERIDADE =====
+#======================
+
+```{r}
+## dados para severidade experiência do analista
+df = dados_sev %>%
+  filter(Ano != 2020)
+
+alto.BS = df$Severidade[df$Grupo_Tarifario == "Alto"]
+medio.BS = df$Severidade[df$Grupo_Tarifario == "Medio"]
+baixo.BS = df$Severidade[df$Grupo_Tarifario == "Baixo"]
+
+M2 = matrix(c(alto.BS, medio.BS, baixo.BS), byrow = TRUE, ncol = 3)
+colnames(M2) = c("2017", "2018", "2019")
+rownames(M2) = c("Alto", "Medio", "Baixo")
+M2
+
+```
+
+```{r}
+
+#model <- stan_model("bulhmann-straub-severidade-02.stan")
+
+# ----------------------
+# ---- rodando stan ----
+# ----------------------
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+stan.dados <- list(x = M2, m = 3, n = 3)   # dados que entram no modelo
+
+amostras <- stan("C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/bulhmann-straub-severidade-02.stan",
+                 data = stan.dados,
+                 warmup = 30000,
+                 control = list(adapt_delta=0.999),
+                 iter = 100000,
+                 thin = 30,
+                 chains = 2)
+
+```
+
+A implementação foi realizada em linguagem Stan, utilizando o algoritmo HMC (Hamiltonian Monte Carlo). Foram adotadas 100.000 iterações por cadeia, com descarte de 30.000 para *warmup*, além de um *thin* de 30 e duas cadeias em paralelo. 
+
+## 4.6 Análise das Saídas e Diagnóstico das Cadeias de Markov
+
+```{r}
+# ---------------------------
+# ---- analisando saidas ----
+# ---------------------------
+s.post <- extract(amostras)   # transforma as saidas (objeto do rstan) em listas do R
+names(s.post)
+
+saveRDS(s.post,"output-bulhmann-straub-severidade-ajustado.rds")
+
+mu.s<- s.post$mu # premio de credibilidade
+
+## o erro padrão
+std.error.post<- apply(s.post$mu, 2, sd)
+std.error.post
+```
+As estimativas posteriores para os prêmios de credibilidade (`mu`) foram obtidas a partir da simulação via MCMC. Os valores constam na tabela std.error.post
+
+Esses valores indicam o grau de incerteza associado a cada estimativa de `mu`. Observa-se que os erros padrão são relativamente elevados, o que está em linha com os alertas emitidos durante a execução do modelo.
+
+```{r traceplot-mu, echo=FALSE, fig.width=12, fig.height=4, fig.align='center', fig.cap="Traceplot das cadeias MCMC para os grupos Alto, Médio e Baixo"}
+
+colnames(mu.s) <- c("Alto", "Médio", "Baixo")
+
+color_scheme_set("brightblue")
+
+mcmc_trace(mu.s) + 
+  theme_bw() + 
+  theme(legend.position = "bottom")
+
+# avalia convergência das cadeias do MCMC
+
+summary(amostras)$summary[, "Rhat"]
+
+```
+
+```{r}
+
+## densidade a posteriori
+color_scheme_set("brightblue")
+colnames(mu.s)<- c('Alto', 'Médio', 'Baixo')
+mcmc_areas(mu.s, prob=0.95, point_est="mean")+ theme_bw() +
+  labs(x = "valor do sinistro", y = "grupos de risco", title = NULL) 
+
+## intervalos de credibilidade de 95%
+q025<- function(x){quantile(x,0.025)}
+q975<- function(x){quantile(x,0.975)}
+
+summary.post <- data.frame(Pbayes= apply(s.post$mu,2,median),
+                          lowerIC= apply(s.post$mu, 2, q025), upperIC= apply(s.post$mu, 2, q975))
+summary.post
+
+### estimativa pontual a posteriori e intervalo de credibilidade
+color_scheme_set("brightblue")
+mcmc_intervals(mu.s, point_est="mean", inner_size=0.025, outer_size=0.975) + theme_bw() +
+  labs(x = "grupos de risco", y = "valor do sinistro", title = "Prêmio de Bayes (IC 95%)") +
+  geom_point(aes(x=summary.post$Pbayes,y=3:1), col="lightgreen", size=3) 
+
+### autocorrelacao das cadeias
+acf(s.post$mu[,1])
+acf(s.post$mu[,2])
+acf(s.post$mu[,3])
+acf(s.post$sigma2vet[,1])
+acf(s.post$sigma2vet[,2])
+acf(s.post$sigma2vet[,3])
+acf(s.post$mu0)
+
+### estimativa pontual 
+summary(s.post$mu[,1])  ### Pcred.1 bayes
+summary(s.post$mu[,2])  ### Pcred.2 bayes
+summary(s.post$mu[,3])  ### Pcred.3 bayes
+
+summary(s.post$sigma2vet[,1])
+summary(s.post$sigma2vet[,2])
+summary(s.post$sigma2vet[,3])
+
+# premio coletivo
+summary(s.post$mu0)  
+
+boxplot(t(M2), ylab="valor pago", cex=1.5, cex.lab=1.5,cex.axis=1.5)
+
+summary(s.post$w[,1])
+summary(s.post$w[,2])
+summary(s.post$w[,3])
+
+Pcred1 = median(s.post$mu[,1])
+Pcred2 = median(s.post$mu[,2])
+Pcred3 = median(s.post$mu[,3])
+
+w1 = median(s.post$w[,1])
+w2 = median(s.post$w[,2])
+w3 = median(s.post$w[,3])
+
+w=c(w1,w2,w3)
+w
+
+Pcol = median(s.post$mu0)
+
+Pind1 = (Pcred1 - (1-w1)*Pcol)/w1
+Pind2 = (Pcred2 - (1-w2)*Pcol)/w2
+Pind3 = (Pcred3 - (1-w3)*Pcol)/w3
+
+# Resultado tabelado
+
+df_sev <- summary.post %>% mutate(
+  Grupo = c("Alto", "Médio", "Baixo"),
+  Premio_Individual = c(Pind1, Pind2, Pind3),
+  Premio_Coletivo = rep(Pcol, 3),
+  Premio_Credibilidade = Pbayes
+) %>% select(Grupo, Premio_Individual, Premio_Coletivo, Premio_Credibilidade, lowerIC, upperIC)
+df_sev
+
+```
+A densidade a posteriori tem um comportamento de distibuição normal, conforme distribuições a priori consideradas para a modelagem da severidade de sinsitros. 
+
+A densidade a posteriori oferece uma visão completa da incerteza e variabilidade dos parâmetros após a análise dos dados, e o summary post fornece um resumo quantitativo dessa informação para facilitar a interpretação e a tomada de decisões. O summary post apresentado mostra o Premio de Bayes, que é a média da distribuição a posteriori para o parâmetro mu de cada grupo e os seus limites mínimos e máximos do intervalo de credibilidade de 95% para mu. Isso significa que há uma probabilidade de 95% de que o verdadeiro valor de mu esteja dentro desse intervalo, tendo em vista os dados observados e a distribuição a priori assumida. A tabela também classifica os Prêmios de Bayes e os seus respectivos intervalos por classe de Risco Alta, Média e Baixo dos Grupos Tarifários. Os intervalos de credibilidade não apresentam diferenças estatísticamente significativas, mas há uma diferença na média obtida para os diferentes Grupos de Risco.
+
+Em relação às autocorrelações das cadeias, os gráficos de autocorrelação mostram uma queda rápida para valores próximos de zero, indicando que a cadeia está se misturando bem e fornecendo estimativas precisas para theta, pois uma autocorrelação baixa sugere que as amostras são menos dependentes entre si. Já para o fator de credibilidade (w), os gráficos mostram que há uma baixa autocorrelação, logo, a cadeia está explorando eficientemente o espaço amostral para w, resultando em estimativas mais confiáveis já que as amostras de w são aproximadamente independentes. Para mu0, a FAC (Função de Autocorrelação) mostra que há dependência até aproximadamente a terceira amostra de mu0, indicando que existe algum grau de dependência entre as amostras do parâmetro global.
+
+As estimativas pontuais para w e para mu apresentam os instantes amostrais dos parâmetros para os 3 grupos tarifários: Alto, Médio e Baixo. Pode-se notar que a mediana é ligeiramente superior à média dos grupos tarifários alto, médio e baixo para os parâmetros mu. O sigma2 indica os erros e apesar de existir um variância elevada, ao se levar em conta a magnitude dos dados, tais erros são aceitáveis. Em relação ao mu0, observam-se valores de instantes amostrais mais altos, por refletir uma média global do parâmetro mu no modelo. Além disso, ao avaliar os valores de média e mediana, vê-se que são bem próximos. Para esse estudo, optou-se por utilizar a mediana para as estimativas.
+
+Os fatores de credibilidade aproximam-se mais de 1 que de 0 para o Grupo Tarifário de Baixo Risco e de 0 para os Grupos Tarifários de Alto e Médio Risco, o que indica que para o primeiro há maior peso atribuído à experiência individual de cada grupo na estimativa do prêmio de seguro, em comparação com a média coletiva, enquanto para os outros Grupos há maior peso atribuído à média coletiva. É possível notar que o fator de credibilidade é maior para o Grupo tarifário de baixo risco em comparação aos de Médio e Alto Risco. Além disso, com fatores de credibilidade em torno de 0,50 para os Grupos Alto e Médio, os prêmios de credibilidade calculados para cada grupo estão recebendo pesos aproximadamente iguais baseados na experiência individual do grupo e na média coletiva. Ainda assim, há uma maior ponderação da experiência individual da classe de Baixo Risco sendo atribuída aos valores dos premios de credibilidade obtidos para essa classe.
+
+# ========================================
+# FREQUÊNCIA
+# ========================================
+
+## Carregar dados
+
+```{r}
+df_regiao <- read.csv("C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020_Agrupada_Regiao.csv", encoding = "UTF-8")
+df_regiao_ano <- read.csv("C:/Pós em Atuária/Trabalho de Conclusão de Curso/Analise/Base/HB20_2017-2020_Agrupado_Regiao_Ano.csv", encoding = "UTF-8")
+```
+
+# ===========================================
+# AGRUPANDO POR GRUPOS TARIFARIOS - Analista
+# ===========================================
+```{r}
+grupoAlt = unique((df_regiao %>% filter(Grupo_Tarifario == "Alto"))$Regiao) # alto indice de roubos
+grupoMed = unique((df_regiao %>% filter(Grupo_Tarifario == "Medio"))$Regiao) # medio indice de roubos
+grupoBai = unique((df_regiao %>% filter(Grupo_Tarifario == "Baixo"))$Regiao) # baixo indice de roubos
+
+df = df_regiao_ano %>%
+  mutate(Grupo_Tarifario = case_when(
+    Regiao %in% grupoAlt ~ "Alto",
+    Regiao %in% grupoMed ~ "Medio",
+    Regiao %in% grupoBai ~ "Baixo")) %>%
+  group_by(Grupo_Tarifario, Ano) %>%
+  summarise(Expostos = sum(Expostos),
+            Freq_Total = sum(Freq_Total),
+            Ind_Total = sum(Ind_Total)) %>%
+  mutate(Frequencia = Freq_Total / Expostos,
+         Severidade = case_when(
+           Freq_Total > 0 ~ Ind_Total/Freq_Total,
+           TRUE ~ 0),
+         Razao = Ind_Total / Expostos)
+View(df)
+```
+
+``` {r}
+# preparando o stan
+
+
+### Versão Bayesiana do modelo de Bühlmann-Straub considerando a experiência do analista
+#======================
+#===== FREQUÊNCIA =====
+#======================
+
+## dados para frequência
+df_freq = df %>%
+  filter(Ano != 2020) %>%
+  mutate(Razao_Freq = Frequencia)
+
+alto.BSf = df_freq$Razao_Freq[df_freq$Grupo_Tarifario == "Alto"]
+medio.BSf = df_freq$Razao_Freq[df_freq$Grupo_Tarifario == "Medio"]
+baixo.BSf = df_freq$Razao_Freq[df_freq$Grupo_Tarifario == "Baixo"]
+
+M3 = matrix(c(alto.BSf,medio.BSf,baixo.BSf), byrow = TRUE, ncol = 3)
+colnames(M3) = c("2017","2018","2019")
+rownames(M3) = c("Alto","Medio","Baixo")
+M3
+
+```
+
+## A frequência de sinistros será dada pela contagem de sinistros sobre a exposição, então será necessário calcular a variável Razão Frequência.
+
+Será considerado o modelo de Bühlmann-Straub para modelar a frequência de sinistros onde todas as quantidades aleatórias envolvidas são completamente especificadas
+
+
+(i) $$N_{it}$$ são independentes condicionais a $$\theta_i$$
+(ii) $$E[N_{it} \mid \theta_i] = \text{Var}(N_{it} \mid \theta_i) = v_{it} \lambda_0 \theta_i$, onde $\lambda(\theta_i)= \lambda_0 \theta_i$, $\quad j=1:T_i$$
+
+(iii) Definimos  $$F_{it} = N_{it}/v_{it}$$, como a frequência do número de sinistros.
+(iv) Podemos assumir que o número de sinistros segue uma distribuição Poisson dado por:
+$$
+N_{it} \sim \text{Poisson}(\lambda_{it}), \quad \lambda_{it} = v_{it} \theta_i \lambda_0
+$$
+
+O principal interesse é obter o Prêmio de Credibilidade para o número de sinistros, que é dado por:
+$$
+\hat{\lambda}_{i} = \omega_i \bar{F}_i + (1 - \omega_i) \lambda_0
+$$
+
+onde
+$$
+\omega_i = \frac{v_i}{v_i + k}
+$$
+
+$$k = \frac{1}{\lambda_0} \text{Var}(\theta_i)$$
+
+
+Sob a abordagem Bayesiana, definem-se as prioris, tal que assumiremos:
+
+$$\begin{aligned}
+\theta_i &\sim \text{Gama}(\theta_0, \theta_0) \\
+\theta_0 &\sim \text{Gama}(0.001, 0.001)\\
+\lambda_0 &\sim \text{Gama}(0.001, 0.001)
+\end{aligned}
+$$
+
+```{r}
+
+### volume (numero de segurados, por periodo e classe de risco)
+alto.BE = df_freq$Expostos[df_freq$Grupo_Tarifario == "Alto"]
+medio.BE = df_freq$Expostos[df_freq$Grupo_Tarifario == "Medio"]
+baixo.BE = df_freq$Expostos[df_freq$Grupo_Tarifario == "Baixo"]
+
+v = matrix(c(alto.BE,medio.BE,baixo.BE), byrow = TRUE, ncol = 3)
+colnames(v) = c("2017","2018","2019")
+rownames(v) = c("Alto","Medio","Baixo")
+v
+
+### numero de sinistros (sinistros, por periodo e classe de risco)
+alto.BF = df_freq$Freq_Total[df_freq$Grupo_Tarifario == "Alto"]
+medio.BF = df_freq$Freq_Total[df_freq$Grupo_Tarifario == "Medio"]
+baixo.BF = df_freq$Freq_Total[df_freq$Grupo_Tarifario == "Baixo"]
+
+n = matrix(c(alto.BF,medio.BF,baixo.BF), byrow = TRUE, ncol = 3)
+colnames(n) = c("2017","2018","2019")
+rownames(n) = c("Alto","Medio","Baixo")
+n
+
+fi = n/v ### matriz frequencia do num. de sinistros por periodo e classe de risco
+m = ncol(fi) ### classes (grupos)
+Ti = nrow(fi) ### periodo (anos)
+
+Find = colSums(n)/colSums(v) ### frequencia do numero de sinistros (obitos)
+```
+```{r}
+stan.lab = "data{   // aqui vc declara qualquer informacao dos dados; definir o tipo de variavel e limites ajuda na eficiencia
+  int<lower=1> m;   // numero de grupos
+  int<lower=1> Ti; // anos de estudo 
+  vector<lower=0>[m] Find;
+  int<lower=1> n[Ti,m]; //  numero de obitos por ano e grupo - inteiro
+  matrix[Ti,m] v; // exposicao por ano e grupo
+  matrix[Ti,m] fi;   // matriz de taxas de mort. por ano e grupo
+ }
+ 
+ 
+parameters{   // 
+  vector<lower=0>[m] theta;  // premios de credibilidade para cada grupo
+  real<lower=0> theta0;
+  real<lower=0> lambda0; //
+}
+
+
+transformed parameters{   // aqui vc declara qualquer parametro que eh funcao de outros
+  vector<lower=0>[m] w;   // fator de credibilidade para cada grupo
+  vector<lower=0>[m] mucred;  // estimador de credibilidade 
+  matrix[Ti,m] lambda;
+  // vector<lower=0>[m] lambda;
+  
+  for(i in 1:m){
+     for(t in 1:Ti){
+    lambda[t,i] = v[t,i]*theta[i]*lambda0;
+     }
+}
+    for(i in 1:m){
+      w[i]=sum(v[,i])/(sum(v[,i])+ (theta0/lambda0)); // fator de credibilidade
+      mucred[i]= w[i]*Find[i]+(1-w[i])*lambda0;
+  }
+} //
+
+model{   // aqui vc define o modelo e as prioris
+  // prioris
+  for(i in 1:m){
+  theta[i] ~ gamma(theta0,theta0); 
+  }  // premio cobrado para os i=1,..., m grupos
+  lambda0 ~ gamma(0.001, 0.001);
+  theta0 ~ gamma(0.001,0.001);
+  // verossimilhanca
+  for(i in 1:m){  // grupo
+   for(t in 1:Ti){ // anos 
+      n[t,i] ~ poisson(lambda[t,i]);  //
+    // n[t,i] ~ poisson(lambda[i]);  //
+    } //
+  }
+} //  a ultima linha é sempre em branco
+"
+
+stan.dados <- list(v=v,n=n, fi=fi, m=m, Ti=Ti, Find=Find)   # dados que entram no modelo
+
+amostras <- stan(model_code = stan.lab,
+                 data = stan.dados,
+                 warmup=10000,
+                 iter=30000,
+                 thin=30,
+                 chains=2)
+
+```
+A implementação foi realizada em linguagem Stan, utilizando o algoritmo HMC (Hamiltonian Monte Carlo). Foram adotadas 10.000 iterações por cadeia, com descarte de 30.000 para *warmup*, além de um *thin* de 30 e duas cadeias em paralelo.
+
+```{r}
+
+#### extraindo as cadeias
+
+s.post2 <- extract(amostras)  
+
+theta.s <- s.post2$theta
+w.s <- s.post2$w 
+
+colnames(theta.s) <- c('Alto', 'Medio', 'Baixo')
+colnames(w.s) <- c('Alto', 'Medio', 'Baixo')
+
+### traço da cadeia de theta
+
+color_scheme_set("brightblue")
+mcmc_trace(theta.s)+ theme_bw() +theme(legend.position = "bottom")
+mcmc_trace(w.s) + theme_bw() + theme(legend.position = "bottom")
+
+# avalia convergência das cadeias do MCMC
+
+summary(amostras)$summary[, "Rhat"]
+
+## calculando o erro padrão
+std.error.post<- apply(s.post2$theta, 2, sd)
+std.error.post
+
+```
+Os parâmetros theta e w obtidos por meio da simulação MCMC representam, respectivamente, os fatores de risco específicos de cada grupo e os fatores de credibilidade associados a esses grupos.*
+
+Parâmetro theta: O vetor theta contêm os fatores de risco específicos estimados para cada grupo tarifário especificado (Alto, Médio e Baixo). Tais valores indicam o quanto cada grupo se desvia do risco médio da população. Por exemplo, um valor de theta maior que 1 sugere que o grupo possui um risco maior que a média, enquanto um valor menor que 1 indica um risco menor.
+
+Os resultados dos parâmetros mostram que os valores medianos de theta ultrapassam 1 para o grupo Alto e estão abaixo de 1 para os grupos Médio e Baixo. Isso indica que o grupo Alto têm um risco acima da média, enquanto os grupos Médio e Baixo possuem um risco inferior.
+
+O vetor w representa os fatores de credibilidade para cada grupo, calculados com base na variabilidade dos dados dentro e entre os grupos. Valores de w próximos de 1 indicam alta credibilidade nas estimativas específicas do grupo, enquanto valores próximos de 0 sugerem que há maior confiança na média coletiva.
+
+Ao observar os valores de w obtidos por meio das cadeias, vê-se que para os Grupos Tarifários Alto e Médio estão sendo utilizadas a experiência coletiva e individual com pesos similares. Já para o Grupo Tarifário Alto, a experiência individual tem um maior efeito em comparação à média coletiva.
+
+Em relação aos erros padrãos os valores dos erros obtidos para os parâmetros𝜃nos grupos "Alto", "Médio" e "Baixo" representam a incerteza associada às estimativas desses parâmetros. Especificamente, os erros indicam o grau de variabilidade esperado nas estimativas de 𝜃 se múltiplas amostras fossem extraídas da mesma população. Quanto menor o erro padrão, maior a precisão da estimativa.
+
+Os erros padrãos obtidos para os Grupos tarifários Alto, Médio e Baixo podem ser consultados na tabela std.error.post. Esses valores sugerem que as estimativas de 𝜃 para os três grupos possuem níveis de precisão relativamente semelhantes, com o grupo "Baixo" apresentando uma precisão ligeiramente maior.
+
+``` {r}
+
+## densidade a posteriori
+color_scheme_set("brightblue")
+colnames(w.s)<- c('Alto', 'Médio', 'Baixo')
+mcmc_areas(w.s, prob=0.95, point_est="mean")+ theme_bw() +
+  labs(x = "frequencia de sinistro", y = "grupos de risco", title = NULL) 
+
+## intervalos de credibilidade de 95%
+q025 <- function(x) quantile(x, 0.025)
+q975 <- function(x) quantile(x, 0.975)
+
+summary.post <- data.frame(
+  Pbayes  = apply(s.post2$theta, 2, function(x) median(s.post2$lambda0 * x)),
+  lowerIC = apply(s.post2$theta, 2, function(x) quantile(s.post2$lambda0 * x, 0.025)),
+  upperIC = apply(s.post2$theta, 2, function(x) quantile(s.post2$lambda0 * x, 0.975))
+)
+summary.post
+
+### estimativa pontual a posteriori e intervalo de credibilidade
+color_scheme_set("brightblue")
+mcmc_intervals(theta.s, point_est="mean", inner_size=0.025, outer_size=0.975) + theme_bw() +
+  labs(x = "grupos de risco", y = "valor do sinistro", title = "Prêmio de Bayes (IC 95%)") +
+  geom_point(aes(x=summary.post$Pbayes,y=3:1), col="lightgreen", size=3) 
+
+
+### autocorrelacao das cadeias
+acf(s.post2$w[,1])
+acf(s.post2$w[,2])
+acf(s.post2$w[,3])
+acf(s.post2$theta[,1])
+acf(s.post2$theta[,2])
+acf(s.post2$theta[,3])
+acf(s.post2$theta0)
+
+### estimativa pontual 
+summary(s.post2$w[,1])  ### Pcred.1 bayes
+summary(s.post2$w[,2])  ### Pcred.2 bayes
+summary(s.post2$w[,3])  ### Pcred.3 bayes
+
+summary(s.post2$theta[,1])
+summary(s.post2$theta[,2])
+summary(s.post2$theta[,3])
+
+summary(s.post2$theta0)  
+
+boxplot(t(M3), ylab="valor pago", cex=1.5, cex.lab=1.5,cex.axis=1.5)
+
+# calculando os prêmios de credibilidade e premio individual para frequência
+
+Pcred1_freq = (s.post2$lambda0) *  (s.post2$theta[,1]) 
+Pcred2_freq = (s.post2$lambda0) *  (s.post2$theta[,2]) 
+Pcred3_freq = (s.post2$lambda0) *  (s.post2$theta[,3]) 
+
+summary(Pcred1_freq)
+summary(Pcred2_freq)
+summary(Pcred3_freq)
+
+# extraindo as medianas para tabelar e calcular prêmio individual
+
+Pcred1_freq1 = median(Pcred1_freq)
+Pcred2_freq2 = median(Pcred2_freq)
+Pcred3_freq3 = median(Pcred3_freq)
+
+# Intervalos de confiança de 95% para prêmio de frequência (credibilidade full Bayes)
+IC_freq <- matrix(NA, ncol = 2, nrow = 3)
+colnames(IC_freq) <- c("lower_IC", "upper_IC")
+rownames(IC_freq) <- c("Grupo1", "Grupo2", "Grupo3")
+
+for (i in 1:3) {
+  amostras_premio <- s.post2$lambda0 * s.post2$theta[, i]
+  IC_freq[i, ] <- quantile(amostras_premio, probs = c(0.025, 0.975))
+}
+IC_freq
+
+# calculando os fatores de credibilidade para frequência
+
+w1_freq = median(s.post2$w[,1])
+w2_freq = median(s.post2$w[,2])
+w3_freq = median(s.post2$w[,3])
+
+w_freq=c(w1_freq,w2_freq,w3_freq)
+w_freq
+
+# calculando o prêmio coletivo para frequência
+
+Pcol_freq = median(s.post2$lambda0)
+
+# calculando os prêmios individuais
+
+Pind1_freq = (Pcred1_freq1 - (1-w1_freq)*Pcol_freq)/w1_freq
+Pind2_freq = (Pcred2_freq2 - (1-w2_freq)*Pcol_freq)/w2_freq
+Pind3_freq = (Pcred3_freq3 - (1-w3_freq)*Pcol_freq)/w3_freq
+
+# Resultado tabelado
+
+df_freq <- summary.post %>% mutate(
+  Grupo = c("Alto", "Médio", "Baixo"),
+  Premio_Individual = c(Pind1_freq, Pind2_freq, Pind3_freq),
+  Premio_Coletivo = rep(Pcol_freq, 3),
+  Premio_Credibilidade = Pbayes
+) %>% select(Grupo, Premio_Individual, Premio_Coletivo, Premio_Credibilidade, lowerIC, upperIC)
+df_freq
+
+```
+A densidade a posteriori tem um comportamento de distibuição poisson-gama, conforme distribuições a priori consideradas para a modelagem da frequência de sinsitros.
+
+A densidade a posteriori oferece uma visão completa da incerteza e variabilidade dos parâmetros após a análise dos dados, e o summary.post fornece um resumo quantitativo dessa informação para facilitar a interpretação e a tomada de decisões. O summary post apresentado mostra o Premio de Bayes, que é a média da distribuição a posteriori para o parâmetro θ de cada grupo e os seus limites mínimos e máximos do intervalo de credibilidade de 95% para θ. Isso significa que há uma probabilidade de 95% de que o verdadeiro valor de θ esteja dentro desse intervalo, tendo em vista os dados observados e a distribuição a priori assumida. A tabela também classifica os Prêmios de Bayes e os seus respectivos intervalos por classe de Risco Alto, Médio e Baixo dos Grupos Tarifários.
+
+Em relação às autocorrelações de theta, os gráficos de autocorrelação mostram uma queda rápida para valores próximos de zero, indicando que a cadeia está se misturando bem e fornecendo estimativas precisas para theta, pois uma autocorrelação baixa sugere que as amostras são menos dependentes entre si. Já para o fator de credibilidade (w), os gráficos mostram que há uma baixa autocorrelação, logo, a cadeia está explorando eficientemente o espaço amostral para w, resultando em estimativas mais confiáveis já que as amostras de w são aproximadamente independentes. 
+
+As estimativas pontuais para w e para theta apresentam os instantes amostrais dos parâmetros para os 3 grupos tarifários: Alto, Médio e Baixo. Para w pode-se notar que a mediana e a média do grupo tarifário baixo é ligeiramente superior a do grupo médio, que é ligeiramente superior à média e mediana do grupo tarifário alto. Já para os parâmetros theta, as medianas e média apresentam comportamentos que seguem o comportamento dos agrupamentos de Risco, sendo o theta 1 maior que o 2 e o theta 3 maior que o 2. Em relação ao theta 0, observam-se valores de instantes amostrais mais altos, por refletir uma média global do parâmetro theta no modelo.
+
+Os fatores de credibilidade não são muito próximos a 1, o que indica o peso atribuído à experiência individual de cada grupo na estimativa do prêmio de seguro, em comparação com a média coletiva. É possível notar que o fator de credibilidade é maior para o Grupo tarifário de Baixo Risco em comparação aos de Médio e Alto Risco. Além disso, com fatores de credibilidade não tão altos, os prêmios de credibilidade calculados para cada grupo estão muito próximos dos prêmios baseados de forma proporcional à experiência individual do grupo e à média coletiva.
+
+### Versão Bayesiana do modelo de Bühlmann-Straub considerando a experiência do analista
+
+
+```{r}
+
+# Cálculo do prêmio individual frequência-severidade
+
+Pind1_fs= Pind1_freq * Pind1
+Pind2_fs = Pind2_freq * Pind2
+Pind3_fs = Pind3_freq * Pind3
+
+
+# Cálculo do prêmio coletivo frequência-severidade
+
+Pcol_fs <- Pcol_freq * Pcol
+Pcol_fs
+
+# Cálculo do prêmio de credibilidade frequência-severidade
+
+Pcred1_fs= Pcred1_freq1 * Pcred1
+Pcred2_fs = Pcred2_freq2 * Pcred2
+Pcred3_fs = Pcred3_freq3 * Pcred3
+
+# Resultado tabelado
+
+df_fs = data.frame(
+  Grupo = c("Alto", "Médio", "Baixo"),
+  Premio_Individual = c(Pind1_fs, Pind2_fs, Pind3_fs),
+  Premio_Coletivo = rep(Pcol_fs, 3),
+  Premio_Credibilidade = c(Pcred1_fs, Pcred2_fs, Pcred3_fs)
+)
+df_fs
+
+```
+
+O cálculo do prêmio de frequência-severidade representa o prêmio puro esperado que a seguradora pagará por sinistro individual em cada classe de risco, considerando tanto a probabilidade de ocorrência (frequência) quanto o valor médio dos sinistros (severidade). Os valores calculados podem ser observados na tabela df_fs.
+
+Esses valores baseiam-se exclusivamente na experiência observada de cada grupo. É possível notar que tais valores são ligeiramente maiores que os obtidos pela modelagem do prêmio severidade já que considera também a frequência de sinistros dados os expostos por classe de risco no cálculo estimado do prêmio.
+
+O prêmio coletivo foi determinado a partir da multiplicação da severidade coletiva (mu0) pela mediana da frequência coletiva (lambda0). O resultado reflete o custo médio esperado por sinistro considerando toda a carteira avaliada, sem distinção entre os grupos de risco, portanto, é um valor ligeiramente mais elevado em comparação aos prêmios individuais obtidos por classe de risco.
+
+Ao comparar os prêmios individuais e os prêmios de credibilidade nota-se que os prêmios de credibilidade são maiores que os prêmios individuais para o Grupo Alto e quase iguais para os Grupos de Médio e Baixo Risco. Isso deve-se ao prêmio coletivo que é substancialmente maior e influencia o prêmio final. Dessa forma, há equilibrados fatores de credibilidade e equilibrados prêmios de credibilidade em comparação aos prêmios individuais. Destaca-se também que a diferença entre ambos os prêmios é mais acentuada no Grupo Alto, indicando uma maior influência do prêmio individual devido ao menor risco coletivo observado nessa classe.
+
+Conclui-se que, os prêmios de credibilidade ajustam os prêmios individuais considerando a variabilidade e a incerteza associadas a cada grupo, proporcionando uma estimativa mais robusta e equilibrada para a precificação de seguros. Apesar disso, uma experiência coletiva elevada como a observada pode influenciar de forma considerável o prêmio de credibilidade. Poderiam ser adotadas estratégias como aumentar a exposição dos grupos coletando e utilizando mais dados sobre os sinistros a fim de melhorar a precisão das estimativas individuais; e a adoção de uma segmentação mais assertiva das classes de Riscos, por exemplo dividindo os segurados em grupos mais homogêneos em termos de risco para obter estimativas mais precisas e reduzir a variabilidade dentro dos grupos.
+
+```{r}
+#=================================================================================
+# MACHINE LEARNING - Aplicação para prever premio frequência-severidade individual
+#=================================================================================
+
+# ===== RF e XGBoost considerando as distribuições de frequência e severidade separadamente =====
+
+# Filtrando o ano de teste para os modelos
+
+df2020 = df %>%
+  filter(Ano == 2020)
+df2020
+
+# Calculando médias globais para inserir como novas variáveis nos modelos
+media_freq_global <- mean(df$Freq_Total / df$Expostos, na.rm = TRUE)
+media_sev_global <- mean(df$Ind_Total / df$Freq_Total, na.rm = TRUE)
+
+# Adicionando variáveis ao df_rf
+df_rf <- df %>%
+  mutate(
+    Frequencia = Freq_Total / Expostos,
+    Severidade = case_when(Freq_Total > 0 ~ Ind_Total / Freq_Total, TRUE ~ 0),
+    Premio_Puro = Ind_Total / Expostos,
+    GrupoTarifario_idx = case_when(
+      Grupo_Tarifario == "Alto" ~ 1,
+      Grupo_Tarifario == "Medio" ~ 2,
+      Grupo_Tarifario == "Baixo" ~ 3
+    )
+  ) %>%
+  group_by(GrupoTarifario_idx) %>%
+  mutate(
+    Freq_esperada = mean(Frequencia, na.rm = TRUE),
+    Razao_freq_esp_obs = Frequencia / media_freq_global,
+    Var_freq = var(Frequencia, na.rm = TRUE),
+    
+    Sev_esperada = mean(Severidade, na.rm = TRUE),
+    Razao_sev_esp_obs = Severidade / media_sev_global,
+    Var_sev = var(Severidade, na.rm = TRUE)
+  ) %>%
+  ungroup()
+  
+
+# ===== 2. Modelo Random Forest para Frequência =====
+X_freq <- df_rf %>% select(Frequencia, GrupoTarifario_idx, Razao_freq_esp_obs, Var_freq)
+set.seed(12)
+modeloRf_freq <- randomForest(Frequencia ~ GrupoTarifario_idx,
+                              data = X_freq,
+                              ntree = 100)
+
+
+# ===== 3. Modelo Random Forest para Severidade =====
+X_sev <- df_rf %>% select(Severidade, GrupoTarifario_idx,Razao_sev_esp_obs, Var_sev)
+
+set.seed(12)
+modeloRf_sev <- randomForest(Severidade ~ GrupoTarifario_idx,
+                             data = X_sev,
+                             ntree = 100)
+
+# ===== 4. Previsões para os grupos de 2020 =====
+dados_2020 <- data.frame(GrupoTarifario_idx = c(1, 2, 3))
+
+pred_freq <- predict(modeloRf_freq, newdata = dados_2020)
+pred_sev  <- predict(modeloRf_sev, newdata = dados_2020)
+
+# Resultados tabelados para Frequencia
+
+df_freq_rf <- df2020 %>%
+  select(Grupo_Tarifario, Ano, Frequencia) %>%
+  cbind(Esperado_Mod = c(Pcred1_freq1, Pcred3_freq3, Pcred2_freq2), Esperado_RF = pred_freq[c(1,3,2)])
+df_freq_rf
+
+# Resultados tabelados para Severidade
+
+df_sev_rf <- df2020 %>%
+  select(Grupo_Tarifario, Ano, Severidade) %>%
+  cbind(Esperado_Mod = c(Pcred1, Pcred3, Pcred2), Esperado_RF = pred_sev[c(1,3,2)])
+df_sev_rf
+
+# Prêmio previsto = Frequência prevista × Severidade prevista
+pred_premio <- pred_freq * pred_sev
+
+df2020_filtrado <- df2020 %>%
+  filter(Ano == 2020, Grupo_Tarifario %in% c("Alto", "Medio", "Baixo")) %>%
+  arrange(factor(Grupo_Tarifario, levels = c("Alto", "Medio", "Baixo")))
+
+# ===== Resultado tabelado observado e o Bühlmann-Straub =====
+df2020_resultado <- df2020_filtrado %>%
+  ungroup() %>%
+  mutate(Esperado_RF = pred_premio)
+df2020_resultado
+
+# tabela com todos os resultados
+
+comp_RF <- df2020 %>%
+  select(Grupo_Tarifario, Ano, Razao) %>%
+  arrange(factor(Grupo_Tarifario, levels = c("Alto", "Medio", "Baixo"))) %>%
+  ungroup() %>%
+  mutate (
+    Esperado_Mod = c(Pcred1_fs, Pcred2_fs, Pcred3_fs),
+    Esperado_RF = pred_premio[c(1,2,3)]
+  )
+comp_RF
+
+```
+
+## XGboost para severidade
+
+
+``` {r}
+
+X1 <- df_rf %>% select(Grupo_Tarifario, Expostos, Severidade, Razao_sev_esp_obs, Var_sev) %>% 
+  mutate(GrupoTarifario_idx = case_when(Grupo_Tarifario == "Alto" ~ 1,
+                                        Grupo_Tarifario == "Medio" ~ 2,
+                                        Grupo_Tarifario == "Baixo" ~ 3)) %>%
+  group_by(GrupoTarifario_idx) %>% select(-Grupo_Tarifario) %>% as.matrix()
+X1
+
+dados_2020 <- df_rf %>%
+  filter(Ano == 2020, Grupo_Tarifario %in% c("Alto", "Medio", "Baixo")) %>%
+  arrange(factor(Grupo_Tarifario, levels = c("Alto", "Medio", "Baixo"))) %>%
+  select(Expostos, Razao_sev_esp_obs, Var_sev, GrupoTarifario_idx)
+
+### Configurar e treinar o modelo XGBoost
+dtrain1 <- xgb.DMatrix(
+  data = as.matrix(X1[, -2]),   # Todas as colunas exceto a 2 (label)
+  label = X1[, 2]               # Segunda coluna como target
+)
+
+params <- list(
+  objective = "reg:squarederror",
+  eta = 0.1,
+  max_depth = 3,
+  subsample = 0.7
+)
+
+set.seed(12)
+modelo_xgb <- xgboost(params = params, data = dtrain1, nrounds = 100, verbose = 0)
+
+pred.xgbsev <- predict(modelo_xgb, newdata = as.matrix(dados_2020))
+
+comp_sev_XGB <- df2020 %>%
+  select(Grupo_Tarifario, Ano, Severidade) %>%
+  cbind(Esperado_Mod = c(Pcred1, Pcred3, Pcred2), Esperado_RF = pred_sev[c(1,3,2)], Esperado_XGB = pred.xgbsev[c(1,3,2)]) 
+comp_sev_XGB
+
+
+
+# XGBoost para frequência
+
+dados_2020_2 <- df_rf %>%
+  filter(Ano == 2020, Grupo_Tarifario %in% c("Alto", "Medio", "Baixo")) %>%
+  arrange(factor(Grupo_Tarifario, levels = c("Alto", "Medio", "Baixo"))) %>%
+  select(Expostos, Razao_freq_esp_obs, Var_freq, GrupoTarifario_idx)
+
+
+X2 <- df_rf %>% select(Grupo_Tarifario, Expostos, Frequencia, Razao_freq_esp_obs, Var_freq) %>% 
+  mutate(GrupoTarifario_idx = case_when(Grupo_Tarifario == "Alto" ~ 1,
+                                        Grupo_Tarifario == "Medio" ~ 2,
+                                        Grupo_Tarifario == "Baixo" ~ 3)) %>%
+  group_by(GrupoTarifario_idx) %>% select(-Grupo_Tarifario) %>% as.matrix()
+X2
+
+dtrain2 <- xgb.DMatrix(
+  data = as.matrix(X2[, -2]),   # Todas as colunas exceto a 2 (label)
+  label = X2[, 2]               # Segunda coluna como target
+)
+
+params <- list(
+  objective = "reg:squarederror",
+  eta = 0.1,
+  max_depth = 3,
+  subsample = 0.7
+)
+
+set.seed(12)
+modelo_xgb <- xgboost(params = params, data = dtrain2, nrounds = 100, verbose = 0)
+
+pred.xgbfreq <- predict(modelo_xgb, newdata = as.matrix(dados_2020_2))
+
+# Resultados tabelados para Frequencia
+
+comp_freq_XGB <- df2020 %>%
+  select(Grupo_Tarifario, Ano, Frequencia) %>%
+  cbind(Esperado_Mod = c(Pcred1_freq1, Pcred2_freq2, Pcred3_freq3), Esperado_RF = pred_freq[c(1,3,2)], Esperado_XGB = pred.xgbfreq[c(1,3,2)]) 
+comp_freq_XGB
+
+
+# premio frequencia-severidade individual
+
+pred_freq_sev = pred.xgbsev * pred.xgbfreq
+
+
+# Tabela com todos os resultados
+
+comp <- df2020 %>%
+  select(Grupo_Tarifario, Ano, Razao) %>%
+  arrange(factor(Grupo_Tarifario, levels = c("Alto", "Medio", "Baixo"))) %>%
+  ungroup() %>%
+  mutate (
+    Esperado_Mod = c(Pcred1_fs, Pcred2_fs, Pcred3_fs),
+    Esperado_RF = pred_premio[c(1,2,3)],
+    Esperado_XGB = pred_freq_sev[c(1,2,3)]
+  )
+comp
+
+# Gráficos com todos os resultados
+
+
+# Criar um dataframe longo (formato tidy)
+comp_long <- comp %>%
+  mutate(Grupo_Tarifario = factor(Grupo_Tarifario, levels = c("Alto", "Medio", "Baixo"))) %>%
+  select(Grupo_Tarifario, Observado = Razao, Esperado_Mod, Esperado_RF, Esperado_XGB) %>%
+  pivot_longer(
+    cols = -Grupo_Tarifario,
+    names_to = "Modelo",
+    values_to = "Premio"
+  ) %>%
+  arrange(Grupo_Tarifario)
+
+
+# ICs de 95% para severidade
+
+lower95 = apply(s.post$mu, 2, q025)
+upper95 = apply(s.post$mu, 2, q975)
+
+IC95sev = data.frame(lower95, upper95)
+
+# ICs de 95% para frequência
+
+lower95 = apply(s.post2$theta, 2, function(x) quantile(s.post2$lambda0 * x, 0.025))
+upper95 = apply(s.post2$theta, 2, function(x) quantile(s.post2$lambda0 * x, 0.975))
+
+IC95freq = data.frame(lower95, upper95)
+
+# ICs de 95% para o premio frequência-severidade
+
+IC95tot = IC95sev * IC95freq
+IC95tot
+
+# Gráfico com todos os resultados 
+
+comp$Grupo_Tarifario <- factor(comp$Grupo_Tarifario, levels = c("Alto", "Medio", "Baixo"))
+
+ggplot(comp %>% cbind(IC95tot)) +
+  theme_bw() +
+  labs(colour = "", y = "Premio") +
+  geom_pointrange(aes(x = Grupo_Tarifario, y = Esperado_Mod, ymin = `lower95`, ymax = `upper95`, color = "Modelo")) +
+  geom_point(aes(x = Grupo_Tarifario, y = Razao, color = "Observado")) +
+  geom_point(aes(x = Grupo_Tarifario, y = Esperado_RF, color = "Random Forest"), shape = 4, size = 2) +
+  geom_point(aes(x = Grupo_Tarifario, y = Esperado_XGB, color = "XGBoost"), shape = 8, size = 2)
+
+### metrica de comparação dos modelos
+
+# resíduo
+tab_RES <- comp %>% mutate(RES_modelo = Razao - Esperado_Mod,
+                RES_RF = Razao - Esperado_RF,
+                RES_XGB = Razao - Esperado_XGB) %>%
+  select(Grupo_Tarifario, Ano, RES_modelo, RES_RF, RES_XGB) 
+tab_RES
+
+### RMSE (raiz do erro quadratico medio)
+Tab_RMSE <- comp %>% mutate(RMSE_modelo = (Razao - Esperado_Mod)^2,
+                RMSE_RF = (Razao - Esperado_RF)^2,
+                RMSE_XGB = (Razao - Esperado_XGB)^2) %>%
+  select(RMSE_modelo, RMSE_RF, RMSE_XGB) %>% colMeans() %>% sqrt()
+Tab_RMSE
+
+```
+Definições:
+
+Random Forest (Floresta Aleatória) é um algoritmo de aprendizado de máquina supervisionado utilizado tanto para tarefas de classificação quanto de regressão. Ele opera construindo múltiplas árvores de decisão durante o treinamento e, para realizar previsões, combina os resultados dessas árvores. No caso de classificação, a previsão final é determinada pela classe mais votada entre as árvores, para regressão, é calculada a média das previsões individuais. 
+
+XGBoost (eXtreme Gradient Boosting) é uma biblioteca de aprendizado de máquina de código aberto, amplamente utilizada para tarefas de classificação e regressão. Ele implementa uma versão otimizada do algoritmo de gradient boosting, que combina múltiplos modelos fracos, como árvores de decisão, para formar um modelo preditivo mais robusto e preciso.
+
+Conclusão: Ao realizar um teste com modelos de aprendizado supervisionado considerando algoritmos como o Random Forest e o XGBoost, nota-se a partir do gráfico que os dois modelos superestimam bastante o premio frequência-severidade comparado aos dados reais para o Grupo de Alto Risco, entretanto, os modelo de Bullman-Straub e XGBoost aproximaram-se muito mais dos dados observados para o Grupo Médio que o modelo Random Forest. Para o Grupo Tarifário Baixo o modelo XGboost estimou valores de premios frequência-severidade mais próximos dos valores observados em comparação aos modelos Bullman-Straub e Random Forest que superestimaram os prêmios.
+
+O erro quadrático médio foi maior para os modelos de Bullman-Straub e Random Forest e menor para o XGboost. Os valores podem ser observados na Tab_RMSE.
